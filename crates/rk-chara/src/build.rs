@@ -53,6 +53,16 @@ pub struct BuildOptions {
     /// Run Slider Unlocker: highlight positions follow slider values set
     /// outside 0 to 1 instead of stopping at the ends.
     pub slider_unlocker: bool,
+    /// Run Edit Fangs: the card sets the length and spacing of each fang.
+    pub edit_fangs: bool,
+    /// Run Clothing BlendShape: clothing made for it takes the blend shape
+    /// weights the card saved per outfit.
+    pub clothing_blend_shape: bool,
+    /// Run Copy Cha Body Mat: items made for it draw parts with the body's
+    /// own material, so they match the skin.
+    pub copy_body_material: bool,
+    /// Run the Dynamic Bone Distribution Editor on accessories.
+    pub dbde: bool,
     /// Run the Pregnancy plugin: the body grows with the stored week.
     pub pregnancy: bool,
     /// Run the Accessory States plugin: accessories bound to clothes
@@ -65,6 +75,9 @@ pub struct BuildOptions {
     /// Run the Colliders plugin: floor, arm and leg colliders where the
     /// card switches them on, and its changes to skirts and the bust.
     pub colliders: bool,
+    /// Run the Stiletto plugin: a worn shoe with a heel file lifts the body
+    /// and turns the lower legs, feet and toes.
+    pub stiletto: bool,
 }
 
 impl Default for BuildOptions {
@@ -83,10 +96,15 @@ impl Default for BuildOptions {
             clothing_unlocker: true,
             eye_control: true,
             slider_unlocker: true,
+            edit_fangs: true,
+            clothing_blend_shape: true,
+            copy_body_material: true,
+            dbde: true,
             pregnancy: true,
             accessory_states: true,
             uncensor_selector: true,
             colliders: true,
+            stiletto: true,
         }
     }
 }
@@ -122,6 +140,9 @@ struct Builder<'g> {
     unlocked: bool,
     /// `ChaFileStatus.eyesOpenMax` as set when the character is added.
     eyes_open_max: f32,
+    /// Renderers that a `ChaCopyBodyMaterial` component gives the body's
+    /// material, with the queue it asks for (-1 keeps the body's).
+    body_copies: Vec<(Vec<usize>, i32)>,
 }
 
 /// The scripts of one prefab and how the game treats its DynamicBones.
@@ -137,6 +158,8 @@ struct PhysicsSource {
     shake: bool,
     /// Accessory slot, for the Dynamic Bone Editor's settings.
     slot: Option<usize>,
+    /// The prefab's top object, where paths to DynamicBone roots start.
+    root: usize,
 }
 
 impl<'g> Builder<'g> {
@@ -196,6 +219,7 @@ impl<'g> Builder<'g> {
             copy,
             shake,
             slot: None,
+            root: inst.root,
         });
     }
 
@@ -209,7 +233,10 @@ impl<'g> Builder<'g> {
             .loader
             .load_prefab(&mut self.scene, ab, data, item.mod_idx, parent, part)
         {
-            Ok(inst) => Some(inst),
+            Ok(inst) => {
+                self.find_body_copies(&inst);
+                Some(inst)
+            }
             Err(e) => {
                 self.loader.warn(format!("{label}: {e:#}"));
                 None
@@ -434,6 +461,7 @@ impl<'g> Builder<'g> {
         top: usize,
         bones: &HashMap<String, usize>,
         edits: &[crate::dynamic_bone_editor::Edit],
+        dbde: &[crate::dbde::Edit],
         colliders: Option<(crate::colliders::Settings, f32)>,
     ) -> crate::physics::Physics {
         use crate::physics::{self, Bone, DynamicBone, Resolve, Ver01, Ver02};
@@ -511,6 +539,19 @@ impl<'g> Builder<'g> {
                         }
                         if let (Some(slot), Some(root)) = (source.slot, def.root) {
                             crate::dynamic_bone_editor::apply(edits, slot, &scene.nodes[root].name, &mut def);
+                            // DBDE loads after the Dynamic Bone Editor and
+                            // finds the bone by its path in the accessory.
+                            if let Some(e) = crate::dbde::find(dbde, slot, &scene.path_below(source.root, root)) {
+                                if let Some(f) = e.force {
+                                    def.force = glam::Vec3::from(f);
+                                }
+                                if let Some(w) = e.weight {
+                                    def.weight = w;
+                                }
+                                if let Some(a) = e.active {
+                                    def.enabled &= a;
+                                }
+                            }
                         }
                         out.bones.push(Bone::Dynamic(DynamicBone::new(def)));
                     }
@@ -581,6 +622,86 @@ impl<'g> Builder<'g> {
     /// object, so components further down the prefab are not used.
     fn hair_listed(&mut self, inst: &Instance, field: &str) -> Vec<usize> {
         self.listed(inst, Some("ChaCustomHairComponent"), field, true)
+    }
+
+    /// Records the renderers a Copy Cha Body Mat component on the item
+    /// lists, so they can take the body's material once it is finished.
+    fn find_body_copies(&mut self, inst: &Instance) {
+        for (_, script) in &inst.scripts {
+            if self.script_class(script).as_deref() != Some(crate::copy_body_material::SCRIPT) {
+                continue;
+            }
+            let Ok(obj) = script.read() else { continue };
+            let targets: Vec<usize> = match obj.get("rendTarget") {
+                Some(rk_unityfs::UValue::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.as_pptr())
+                    .filter_map(|p| self.game.assets.deref(&script.file, p))
+                    .filter_map(|o| inst.renderer_keys.get(&o.key()).copied())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let queue = obj
+                .get("customRenderQueue")
+                .and_then(rk_unityfs::UValue::as_i64)
+                .unwrap_or(-1) as i32;
+            if !targets.is_empty() {
+                self.body_copies.push((targets, queue));
+            }
+        }
+    }
+
+    /// Clothing BlendShape on one clothing item: the weights its
+    /// `ChaClothesBlendShape` component lists, from the card's entries.
+    fn clothing_blend_shape(
+        &mut self,
+        inst: &Instance,
+        entries: &[crate::clothing_blend_shape::Entry],
+        outfit: usize,
+        category: i32,
+        kind: usize,
+    ) {
+        use crate::clothing_blend_shape as cbs;
+        let Some(script) = inst
+            .scripts
+            .iter()
+            .find(|(_, s)| self.script_class(s).as_deref() == Some(cbs::SCRIPT))
+            .map(|(_, s)| s.clone())
+        else {
+            return;
+        };
+        let Ok(obj) = script.read() else { return };
+        let mut slots = Vec::new();
+        for n in 1..=4 {
+            let named = obj
+                .get(&format!("ItemName0{n}"))
+                .and_then(rk_unityfs::UValue::as_str)
+                .is_some_and(|s| !s.is_empty());
+            let shape = obj
+                .get(&format!("BlendShapeIndex0{n}"))
+                .and_then(rk_unityfs::UValue::as_i64)
+                .unwrap_or(0)
+                .max(0) as usize;
+            let meshes = match obj.get(&format!("Meshes0{n}")) {
+                Some(rk_unityfs::UValue::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.as_pptr())
+                    .filter_map(|p| self.game.assets.deref(&script.file, p))
+                    .filter_map(|o| inst.renderer_keys.get(&o.key()).copied())
+                    .map(|r| (r, self.scene.renderers[r].mesh.blend_shapes.len()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            slots.push(cbs::Slot { named, meshes, shape });
+        }
+        let weights = cbs::weights_for(entries, outfit, category, kind);
+        for (r, shape, w) in cbs::settle(&slots, weights) {
+            let sw = &mut self.scene.renderers[r].shape_weights;
+            if sw.len() <= shape {
+                sw.resize(shape + 1, 0.0);
+            }
+            sw[shape] = w;
+        }
     }
 
     /// Renderers a field of the accessory's ChaAccessoryComponent lists; the
@@ -1091,11 +1212,14 @@ impl<'g> Builder<'g> {
 
     /// Applies the masks a top brings for what is worn under it: one cuts
     /// the body, one the bra, one the inner layer of the top itself. A top
-    /// can also rule out a bra altogether.
+    /// can also rule out a bra altogether. `tops` holds the top, then the
+    /// parts of a sailor or jacket top with their part number: as
+    /// ChangeClothesTopParts does, the first part clears the body and bra
+    /// masks and loads its own, the second does the same for the inner one.
     fn hide_under_top(
         &mut self,
         body: &Instance,
-        tops: &[&Item],
+        tops: &[(&Item, Option<usize>)],
         top_insts: &[Instance],
         bra: Option<&(Instance, &Item)>,
     ) {
@@ -1106,9 +1230,26 @@ impl<'g> Builder<'g> {
             ("OverInnerMaskAB", "OverInnerMask"),
         ];
         let mut no_bra = false;
-        for item in tops {
+        // The first part of a sailor or jacket top sets the body mask even
+        // when it has none, which removes the one the body material stores.
+        let first_part = tops.iter().any(|&(_, part)| part == Some(0));
+        for &(item, part) in tops {
             no_bra |= self.list_int(item, "NotBra") == Some(1);
+            let which: &[usize] = match part {
+                None => &[0, 1, 2],
+                Some(0) => &[0, 1],
+                Some(1) => &[2],
+                Some(_) => &[],
+            };
+            if part.is_some() {
+                for &k in which {
+                    masks[k] = None;
+                }
+            }
             for (k, (ab, tex)) in columns.iter().enumerate() {
+                if !which.contains(&k) {
+                    continue;
+                }
                 if let (Some(ab), Some(tex)) = (item.get(ab), item.get(tex)) {
                     if let Some(image) = self.loader.image_by_name(ab, tex, item.mod_idx) {
                         masks[k] = Some(image);
@@ -1152,6 +1293,15 @@ impl<'g> Builder<'g> {
         };
         if let Some(image) = &body_mask {
             put(&mut self.scene, body, &["o_body_a"], image, [1.0, 1.0], [0.0, 0.0]);
+        } else if first_part {
+            for &ri in &body.renderers {
+                let r = &mut self.scene.renderers[ri];
+                if r.name == "o_body_a" {
+                    if let Some(m) = r.materials.first_mut() {
+                        m.textures.remove("_AlphaMask");
+                    }
+                }
+            }
         }
         if let Some((inst, item)) = bra {
             if no_bra {
@@ -1719,6 +1869,7 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
         cloth_overlays: overlays::clothes(&card.ext, opts.outfit.min(card.coordinates.len().saturating_sub(1))),
         hair_gloss: None,
         physics_sources: Vec::new(),
+        body_copies: Vec::new(),
         unlocked: opts.clothing_unlocker
             && crate::clothing_unlocker::unlocked(&card.ext, opts.outfit.min(card.coordinates.len().saturating_sub(1))),
         eyes_open_max: if opts.eye_control {
@@ -1951,6 +2102,8 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
 
     let outfit = opts.outfit.min(card.coordinates.len().saturating_sub(1));
     let mut accessory_nodes: HashMap<usize, HashMap<String, usize>> = HashMap::new();
+    // The worn shoe's list entry and renderers, for Stiletto.
+    let mut shoe: Option<(&Item, Vec<usize>)> = None;
     let hair_settings = crate::hair_accessories::for_outfit(&card.ext, outfit);
     // Bust size, softness and weight in effect; Pushup may replace them.
     let mut bust = crate::pushup::BodyData::from_body(
@@ -1962,11 +2115,12 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
         if opts.clothes {
             // What the top (and its sub-parts) and the bra say about the
             // pieces around them.
-            let mut top_items: Vec<&Item> = Vec::new();
+            let mut top_items: Vec<(&Item, Option<usize>)> = Vec::new();
             let mut top_insts: Vec<Instance> = Vec::new();
             let mut bra: Option<(Instance, &Item)> = None;
             let (mut no_bottom, mut no_shorts) = (false, false);
             let mut kinds = crate::pushup::StateKinds::default();
+            let blend_shapes = crate::clothing_blend_shape::read(&card.ext);
             for (i, cp) in co.clothes.parts.iter().enumerate().take(9) {
                 // Only one of indoor (7) and outdoor (8) shoes is worn.
                 if (i == 7 && opts.outdoor_shoes) || (i == 8 && !opts.outdoor_shoes) {
@@ -1982,8 +2136,15 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
                     continue;
                 };
                 let inst = b.part(&label, item, Some(top), Part::Clothes(i as u8));
+                if i >= 7 {
+                    let renderers = inst.as_ref().map(|inst| inst.renderers.clone());
+                    shoe = Some((item, renderers.unwrap_or_default()));
+                }
                 let pattern_prop = format!("outfit{outfit}.ChaFileClothes.{}Pattern", cat::CLOTHES_PROPS[i]);
                 if let Some(inst) = &inst {
+                    if opts.clothing_blend_shape {
+                        b.clothing_blend_shape(inst, &blend_shapes, outfit, item.category, i);
+                    }
                     // The game copies DynamicBone roots onto the body
                     // skeleton for tops and bottoms only.
                     b.physics_source(inst, true, i < 2, true);
@@ -2028,7 +2189,7 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
                 match (i, inst) {
                     (0, inst) => {
                         no_bottom = one_piece;
-                        top_items.push(item);
+                        top_items.push((item, None));
                         top_insts.extend(inst);
                     }
                     (2, Some(inst)) => {
@@ -2071,6 +2232,9 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
                             _ => {}
                         }
                         if let Some(inst) = b.part(&sub_label, sub, Some(top), Part::Clothes(0)) {
+                            if opts.clothing_blend_shape {
+                                b.clothing_blend_shape(&inst, &blend_shapes, outfit, sub.category, 0);
+                            }
                             b.physics_source(&inst, true, true, true);
                             assign_weights(&mut b.scene, &inst, &bones, "cf_j_root", hips);
                             hide_undressed_states(&mut b.scene, &inst);
@@ -2082,7 +2246,7 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
                             b.emblems(&inst, cp, &top_prop);
                             top_insts.push(inst);
                         }
-                        top_items.push(sub);
+                        top_items.push((sub, Some(k)));
                     }
                 }
             }
@@ -2211,6 +2375,25 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
     if female && opts.studio {
         crate::hand_size::studio_copy(&mut b.scene, &bones, &mods);
     }
+    // Stiletto turns the bones after the animation, each frame.
+    if let Some((item, renderers)) = shoe.filter(|_| opts.stiletto) {
+        use crate::stiletto as st;
+        let config = st::Config::load(&game.assets.index.game_dir);
+        let heel = config.heel(item.name());
+        // No animation is played, so the lookup has no controller or clip.
+        match st::flags_for(&config.flag_files, None, None) {
+            Ok(flags) => {
+                st::warp_shoe(&mut b.scene, &renderers, &heel, flags);
+                let pose = st::CustomPose::default();
+                // `objBodyBone.transform.parent`: what holds `cf_j_root`.
+                let holder = b.scene.nodes[body_root].parent.unwrap_or(anim.root);
+                st::pose(&mut b.scene, &bones, holder, &heel, flags, &pose, &config.settings);
+            }
+            Err(pattern) => b.loader.warn(format!(
+                "Stiletto: flags pattern `{pattern}` is not supported, heels are not applied"
+            )),
+        }
+    }
     // ChaControl.UpdateVisible: tongue state 0, where Studio starts since it
     // loads cards without their status, shows the face's tongue (S_TongueF)
     // and hides the body's (S_TongueB, shown only in state 1).
@@ -2246,7 +2429,37 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
                 .collect(),
         })
     };
+    // The component copies the body material when the item starts, before
+    // MaterialEditor has changed the body.
+    if opts.copy_body_material {
+        let body = b
+            .scene
+            .renderers
+            .iter()
+            .find(|r| r.part == Part::Body && r.name == "o_body_a")
+            .and_then(|r| r.materials.first().cloned());
+        if let Some(body) = body {
+            for (targets, queue) in std::mem::take(&mut b.body_copies) {
+                for r in targets {
+                    if let Some(m) = b.scene.renderers[r].materials.first_mut() {
+                        *m = crate::copy_body_material::copy(&body, queue);
+                    }
+                }
+            }
+        }
+    }
+
     let material_edits = crate::material_editor::apply(&mut b.scene, &card.ext, outfit, &targets, &shaders);
+
+    if let Some(fangs) = opts.edit_fangs.then(|| crate::edit_fangs::read(&card.ext)).flatten() {
+        for r in b.scene.renderers.iter_mut() {
+            if r.part == Part::Head && r.name == crate::edit_fangs::RENDERER {
+                if let Some(mesh) = crate::edit_fangs::apply(&r.mesh, fangs) {
+                    r.mesh = std::sync::Arc::new(mesh);
+                }
+            }
+        }
+    }
 
     // Physics runs on the finished skeleton, as the game's does once a
     // character is loaded.
@@ -2260,7 +2473,12 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
             .unwrap_or(0.0);
         (crate::colliders::read(&card.ext), bust)
     });
-    let mut physics = b.read_physics(top, &bones, &bone_edits, collider_plugin);
+    let dbde_edits = if opts.dbde {
+        crate::dbde::for_outfit(&card.ext, outfit)
+    } else {
+        Vec::new()
+    };
+    let mut physics = b.read_physics(top, &bones, &bone_edits, &dbde_edits, collider_plugin);
     if opts.physics {
         physics.start(&mut b.scene);
         physics.setup_bust(&mut b.scene, bust.softness, bust.weight, bust.size);
