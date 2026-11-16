@@ -17,7 +17,11 @@ mod ui;
 mod vfs;
 
 #[derive(Parser)]
-#[command(name = "rk", about = "Renkatsu command-line tools")]
+#[command(
+    name = "rk",
+    version,
+    about = "Renkatsu command-line tools: read Koikatsu cards, build and render characters, and compare them with the game"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -125,6 +129,10 @@ enum Cmd {
         /// Where the comparison pictures go.
         #[arg(long, default_value = "renders/scratch/bench")]
         out: PathBuf,
+        /// Also print each card's differences of this kind or about this
+        /// property or texture, such as `_MainTex` or `skinning bones`.
+        #[arg(long)]
+        show: Vec<String>,
     },
     /// Inspect Unity asset bundle files.
     Bundle {
@@ -194,7 +202,12 @@ fn main() -> Result<()> {
             reference::reference(&card, &capture, &out, &opts, &bones, !no_shadows)
         }
         Cmd::Audit { count, threads } => audit::audit(count, threads),
-        Cmd::Bench { list, captures, out } => bench::bench(&list, &captures, &out),
+        Cmd::Bench {
+            list,
+            captures,
+            out,
+            show,
+        } => bench::bench(&list, &captures, &out, &show),
         Cmd::Compare {
             cards,
             count,

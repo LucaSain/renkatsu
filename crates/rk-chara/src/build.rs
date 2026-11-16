@@ -50,6 +50,9 @@ pub struct BuildOptions {
     pub clothing_unlocker: bool,
     /// Run the Eye Control plugin: the card limits how far the eyes open.
     pub eye_control: bool,
+    /// Run Slider Unlocker: highlight positions follow slider values set
+    /// outside 0 to 1 instead of stopping at the ends.
+    pub slider_unlocker: bool,
     /// Run the Pregnancy plugin: the body grows with the stored week.
     pub pregnancy: bool,
     /// Run the Accessory States plugin: accessories bound to clothes
@@ -79,6 +82,7 @@ impl Default for BuildOptions {
             invisible_body: true,
             clothing_unlocker: true,
             eye_control: true,
+            slider_unlocker: true,
             pregnancy: true,
             accessory_states: true,
             uncensor_selector: true,
@@ -569,8 +573,36 @@ impl<'g> Builder<'g> {
 
     /// Like `listed_renderers`, limited to scripts of one class when given.
     fn listed_renderers_in(&mut self, inst: &Instance, class: Option<&str>, field: &str) -> Vec<usize> {
+        self.listed(inst, class, field, false)
+    }
+
+    /// Renderers a field of the hair part's ChaCustomHairComponent lists.
+    /// The game takes the component with `GetComponent` on the part's root
+    /// object, so components further down the prefab are not used.
+    fn hair_listed(&mut self, inst: &Instance, field: &str) -> Vec<usize> {
+        self.listed(inst, Some("ChaCustomHairComponent"), field, true)
+    }
+
+    /// Renderers a field of the accessory's ChaAccessoryComponent lists; the
+    /// game's `cusAcsCmp` is the component on the accessory's root object.
+    fn accessory_listed(&mut self, inst: &Instance, field: &str) -> Vec<usize> {
+        self.listed(inst, Some("ChaAccessoryComponent"), field, true)
+    }
+
+    /// A field of the script of class `class` on the part's root object.
+    fn root_field(&self, inst: &Instance, class: &str, field: &str) -> Option<rk_unityfs::UValue> {
+        inst.scripts
+            .iter()
+            .filter(|(node, s)| *node == inst.root && self.script_class(s).as_deref() == Some(class))
+            .find_map(|(_, s)| s.read().ok()?.get(field).cloned())
+    }
+
+    fn listed(&mut self, inst: &Instance, class: Option<&str>, field: &str, root_only: bool) -> Vec<usize> {
         let mut out = Vec::new();
-        for (_, script) in &inst.scripts {
+        for (node, script) in &inst.scripts {
+            if root_only && *node != inst.root {
+                continue;
+            }
             if class.is_some_and(|c| self.script_class(script).as_deref() != Some(c)) {
                 continue;
             }
@@ -760,7 +792,7 @@ impl<'g> Builder<'g> {
     /// colours on ornaments that are part of the hair style.
     fn color_hair(&mut self, inst: &Instance, part: &rk_card::HairPart) {
         let solid = |c: [f32; 4]| [c[0], c[1], c[2], 1.0];
-        for r in self.listed_renderers(inst, "rendHair") {
+        for r in self.hair_listed(inst, "rendHair") {
             if let Some(m) = self.scene.renderers[r].materials.first_mut() {
                 if let Some(gloss) = &self.hair_gloss {
                     // The material keeps where the mask sits on the strands.
@@ -769,23 +801,23 @@ impl<'g> Builder<'g> {
                         slot.scale = [st[0], st[1]];
                         slot.offset = [st[2], st[3]];
                     }
-                    m.textures.insert("_HairGloss".into(), slot);
+                    m.set_texture("_HairGloss", slot);
                 }
-                m.colors.insert("_Color".into(), solid(part.base_color));
-                m.colors.insert("_Color2".into(), solid(part.start_color));
-                m.colors.insert("_Color3".into(), solid(part.end_color));
-                m.colors.insert("_LineColor".into(), part.outline_color);
+                m.set_color("_Color", solid(part.base_color));
+                m.set_color("_Color2", solid(part.start_color));
+                m.set_color("_Color3", solid(part.end_color));
+                m.set_color("_LineColor", part.outline_color);
             }
         }
         let count = match self.script_field(inst, "acsDefColor") {
             Some(rk_unityfs::UValue::Array(a)) => a.len().min(3),
             _ => 0,
         };
-        for r in self.listed_renderers(inst, "rendAccessory") {
+        for r in self.hair_listed(inst, "rendAccessory") {
             if let Some(m) = self.scene.renderers[r].materials.first_mut() {
                 for (j, name) in ["_Color", "_Color2", "_Color3"].iter().enumerate().take(count) {
                     if let Some(c) = part.acs_color.get(j) {
-                        m.colors.insert((*name).into(), solid(*c));
+                        m.set_color(name, solid(*c));
                     }
                 }
             }
@@ -800,37 +832,40 @@ impl<'g> Builder<'g> {
         hair: Option<&rk_card::HairPart>,
         settings: Option<crate::hair_accessories::HairAccessory>,
     ) {
-        let uses = |b: &Self, field: &str| b.script_field(inst, field).and_then(|v| v.as_bool()).unwrap_or(false);
+        let uses = |b: &Self, field: &str| {
+            b.root_field(inst, "ChaAccessoryComponent", field)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
         let slots = [
             (uses(self, "useColor01"), "_Color"),
             (uses(self, "useColor02"), "_Color2"),
             (uses(self, "useColor03"), "_Color3"),
         ];
-        for r in self.listed_renderers(inst, "rendNormal") {
+        for r in self.accessory_listed(inst, "rendNormal") {
             if let Some(m) = self.scene.renderers[r].materials.first_mut() {
                 for (k, (used, name)) in slots.iter().enumerate() {
                     if let (true, Some(c)) = (*used, acc.color.get(k)) {
-                        m.colors.insert((*name).into(), *c);
+                        m.set_color(name, *c);
                     }
                 }
             }
         }
         if let Some(c) = acc.color.get(3) {
-            for r in self.listed_renderers(inst, "rendAlpha") {
+            for r in self.accessory_listed(inst, "rendAlpha") {
                 // A fully transparent fourth colour switches the part off.
                 self.scene.renderers[r].enabled &= c[3] != 0.0;
                 if let Some(m) = self.scene.renderers[r].materials.first_mut() {
-                    m.colors.insert("_Color4".into(), *c);
+                    m.set_color("_Color4", *c);
                 }
             }
         }
         // The accessory component's own hair renderers follow the hair's
         // root colour. The strands of a hair component are not among them.
-        for r in self.listed_renderers_in(inst, Some("ChaAccessoryComponent"), "rendHair") {
+        for r in self.accessory_listed(inst, "rendHair") {
             if let Some(m) = self.scene.renderers[r].materials.first_mut() {
                 for name in ["_Color", "_Color2", "_Color3"] {
-                    m.colors
-                        .insert(name.into(), hair.map(|h| h.start_color).unwrap_or([1.0; 4]));
+                    m.set_color(name, hair.map(|h| h.start_color).unwrap_or([1.0; 4]));
                 }
             }
         }
@@ -922,9 +957,9 @@ impl<'g> Builder<'g> {
                 continue;
             };
             if let (true, Some(h)) = (settings.color_match, hair) {
-                m.colors.insert("_Color".into(), h.base_color);
-                m.colors.insert("_Color2".into(), h.start_color);
-                m.colors.insert("_Color3".into(), h.end_color);
+                m.set_color("_Color", h.base_color);
+                m.set_color("_Color2", h.start_color);
+                m.set_color("_Color3", h.end_color);
             }
             match (&gloss, settings.hair_gloss) {
                 (Some(g), true) => {
@@ -933,7 +968,7 @@ impl<'g> Builder<'g> {
                         slot.scale = [st[0], st[1]];
                         slot.offset = [st[2], st[3]];
                     }
-                    m.textures.insert("_HairGloss".into(), slot);
+                    m.set_texture("_HairGloss", slot);
                 }
                 _ => {
                     m.textures.remove("_HairGloss");
@@ -943,12 +978,12 @@ impl<'g> Builder<'g> {
                 (true, Some(h)) => h.outline_color,
                 _ => settings.outline_color,
             };
-            m.colors.insert("_LineColor".into(), outline);
+            m.set_color("_LineColor", outline);
         }
         for r in self.listed_renderers_in(inst, Some(HAIR), "rendAccessory") {
             if let Some(m) = self.scene.renderers[r].materials.first_mut() {
                 for name in ["_Color", "_Color2", "_Color3"] {
-                    m.colors.insert(name.into(), settings.accessory_color);
+                    m.set_color(name, settings.accessory_color);
                 }
             }
         }
@@ -1255,7 +1290,7 @@ impl<'g> Builder<'g> {
     }
 
     /// Builds iris and eye-white textures and sets the eye highlights.
-    fn eyes(&mut self, card: &Card, inst: &Instance) {
+    fn eyes(&mut self, card: &Card, inst: &Instance, unclamped_highlights: bool) {
         let face = &card.face;
         let white = self.item_image(
             "eye white",
@@ -1370,14 +1405,14 @@ impl<'g> Builder<'g> {
                             "_overcolor1",
                             &hl_up,
                             face.hl_up_color,
-                            eyelook::highlight_shift(face.hl_up_y),
+                            eyelook::highlight_shift(face.hl_up_y, unclamped_highlights),
                         ),
                         (
                             "_overtex2",
                             "_overcolor2",
                             &hl_down,
                             face.hl_down_color,
-                            eyelook::highlight_shift(face.hl_down_y),
+                            eyelook::highlight_shift(face.hl_down_y, unclamped_highlights),
                         ),
                     ] {
                         match image {
@@ -1842,7 +1877,7 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
                 _ => &card.face.base_makeup,
             };
             b.skin_face(card, makeup, &head, item);
-            b.eyes(card, &head);
+            b.eyes(card, &head, opts.slider_unlocker);
             b.face_lines(card, &head);
             let mut hidden = vec![
                 "cf_O_namida_S",
@@ -2203,6 +2238,12 @@ pub fn build(game: &Game, card: &Card, opts: &BuildOptions) -> Result<Character>
         Some(crate::material_editor::Shader {
             draw: crate::scene::DrawState::from_passes(&info.passes)?,
             queue: info.queue,
+            props: info.props.clone(),
+            defaults: info
+                .defaults
+                .iter()
+                .filter_map(|(n, kind, v)| Some((n.clone(), crate::material_editor::ShaderDefault::parse(kind, v)?)))
+                .collect(),
         })
     };
     let material_edits = crate::material_editor::apply(&mut b.scene, &card.ext, outfit, &targets, &shaders);
